@@ -141,16 +141,16 @@ def slide_title(prs, total):
              size=54, bold=True, color=WHITE, font=HEAD_FONT)
     # Subtitle
     add_text(s, Inches(0.9), Inches(4.7), Inches(11.5), Inches(0.6),
-             "A 12-month price outlook through April 2027, built on 23 years of data",
+             "A 4-month price outlook through August 2026, built on 23 years of data",
              size=20, italic=True, color=CREAM, font=BODY_FONT)
     # Footer
     add_text(s, Inches(0.9), Inches(6.7), Inches(11), Inches(0.3),
-             "Monthly data 2003 \u2013 2026  |  Forecast horizon: April 2027",
+             "Monthly data 2003 \u2013 2026  |  Forecast horizon: August 2026",
              size=12, color=LIGHTGR, font=BODY_FONT)
 
 
 def _read_forecast_summary():
-    """Returns dict with last actuals and April-2027 forecast values."""
+    """Returns dict with last actuals and August-2026 forecast values."""
     fcst = pd.read_csv(config.OUTPUT_DIR / "forecast.csv",
                        index_col="date", parse_dates=True)
     df = pd.read_csv(config.FEATURES_CSV, index_col="date", parse_dates=True)
@@ -201,7 +201,7 @@ def slide_executive_summary(prs, n, total):
         add_text(s, x, y0 + Inches(0.55), tile_w, Inches(1.1),
                  val, size=64, bold=True, color=INK, font=HEAD_FONT, align=PP_ALIGN.CENTER)
         add_text(s, x, y0 + Inches(1.6), tile_w, Inches(0.35),
-                 "by April 2027  |  per barrel (2025 dollars)",
+                 "by August 2026  |  per barrel (2025 dollars)",
                  size=10, color=GRAY, font=BODY_FONT, align=PP_ALIGN.CENTER)
 
     # Sub-caption under tiles
@@ -214,8 +214,8 @@ def slide_executive_summary(prs, n, total):
     add_text(s, Inches(0.55), Inches(4.15), Inches(12.4), Inches(0.45),
              "What this deck shows", size=18, bold=True, color=INK, font=HEAD_FONT)
     add_bullets(s, Inches(0.55), Inches(4.6), Inches(12.4), Inches(2.5), [
-        ("Forecast through April 2027",
-            "12-month projection for both light and heavy oil, with confidence ranges"),
+        ("Forecast through August 2026",
+            "4-month projection for both light and heavy oil, with confidence ranges"),
         ("Built on 23 years of monthly data",
             "supply, demand, dollar strength, geopolitical risk, and conflict history since 2003"),
         ("Four supporting models behind the forecast",
@@ -309,10 +309,10 @@ def slide_methodology(prs, n, total):
 
 
 def slide_forecast(prs, n, total):
-    """Featured slide: 12-month forecast chart with detail."""
+    """Featured slide: 4-month forecast chart with detail."""
     s = prs.slides.add_slide(prs.slide_layouts[6])
     add_bg(s, CREAM)
-    page_header(s, "12-month forecast through April 2027", kicker="The forecast")
+    page_header(s, "4-month forecast through August 2026", kicker="The forecast")
 
     f = _read_forecast_summary()
 
@@ -322,7 +322,7 @@ def slide_forecast(prs, n, total):
     # Right side: prediction summary tiles + interpretation
     rx = Inches(9.2)
     add_text(s, rx, Inches(1.5), Inches(4.0), Inches(0.4),
-             "April 2027 outlook", size=15, bold=True, color=INK, font=HEAD_FONT)
+             "August 2026 outlook", size=15, bold=True, color=INK, font=HEAD_FONT)
 
     # Light tile
     light_box = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
@@ -435,7 +435,7 @@ def slide_limitations(prs, n, total):
         ("Forecast assumes today's conditions hold",
             "supply, demand, dollar, and conflict are held at latest values; a regime shift would change things"),
         ("Confidence range widens with horizon",
-            "by April 2027 the 95% range spans roughly $30\u2013$110; near-term months are tighter"),
+            "by August 2026 the 95% range spans roughly $30\u2013$110; near-term months are tighter"),
         ("Last month's price drives a lot of prediction",
             "realistic for oil, but means a sudden shock would push the whole forecast"),
         ("Some factors couldn't be measured cleanly",
@@ -517,7 +517,7 @@ def slide_closing(prs, n, total):
              "WHAT YOU CAN EXPLORE",
              size=11, bold=True, color=AMBER, font=BODY_FONT)
     add_bullets(s, Inches(0.9), Inches(5.4), Inches(11.5), Inches(1.6), [
-        "A 12-month forecast table with prediction and confidence range per month",
+        "A 4-month forecast table with prediction and confidence range per month",
         "A spreadsheet with all four model results and statistical details",
         "The seven charts shown in this deck, as image files",
         "The complete monthly dataset and the settings file used to build the forecast",

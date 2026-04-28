@@ -91,16 +91,18 @@ REAL_PRICE_BASE_YEAR = 2025
 # ---------------------------------------------------------------------------
 # Regression variable list (right-hand side of log-price regression)
 # ---------------------------------------------------------------------------
+# Dropped from the prior spec: hormuz_threat (B4), gpr, crack_spread.
+# Each had coefficients indistinguishable from zero with wide CIs across all
+# four cells, so they added noise without explanatory power. Hormuz binary is
+# also extremely sparse (a handful of months), and the Brent-WTI crack proxy
+# is colinear with WTI itself.
 REGRESSORS = [
     "log_production",     # B3
-    "hormuz_threat",      # B4
     "log_inventory",      # B5
     "log_price_lag1",     # B6
     "net_exports",        # B7
     "refinery_util",      # D8
     "log_dxy",            # USD index
-    "gpr",                # Geopolitical Risk Index
-    "crack_spread",       # Refining margin proxy
     "month_sin",          # Seasonality
     "month_cos",
 ]

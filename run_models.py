@@ -15,6 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -44,7 +45,10 @@ def _fit_one(df: pd.DataFrame, dep: str, regressors: list[str]) -> sm.regression
         raise ValueError(f"Too few observations: {len(sub)} (need {len(regressors)+5}+)")
     X = sm.add_constant(sub[regressors])
     y = sub[dep]
-    return sm.OLS(y, X).fit()
+    # HAC (Newey-West) standard errors — residuals exhibit lag-1 autocorrelation
+    # (DW ~1.0-1.3), so default OLS SEs are biased downward. maxlags=6 follows
+    # the rule-of-thumb 4*(n/100)^(2/9) for monthly data with n~100-250.
+    return sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
 
 
 def _coef_table(res) -> pd.DataFrame:
@@ -66,8 +70,31 @@ def _diag_table(res, n_obs: int) -> pd.DataFrame:
     }).round(4)
 
 
+def _vif_table(df: pd.DataFrame, dep: str, regressors: list[str]) -> pd.DataFrame:
+    """Variance Inflation Factor for each regressor on the same sample the model used.
+
+    Rule of thumb: VIF > 5 = noticeable collinearity, > 10 = problematic.
+    The lagged log price will dominate (expected, not fixable without changing
+    the model spec) — flag is informational.
+    """
+    sub = df[[dep] + regressors].dropna()
+    X = sm.add_constant(sub[regressors])
+    rows = []
+    for i, name in enumerate(X.columns):
+        if name == "const":
+            continue
+        try:
+            v = variance_inflation_factor(X.values, i)
+        except Exception:
+            v = float("nan")
+        rows.append({"variable": name, "VIF": round(v, 3),
+                     "flag": "HIGH" if v > 10 else ("watch" if v > 5 else "")})
+    return pd.DataFrame(rows)
+
+
 def _write_sheet(wb: Workbook, name: str, header: dict, coef_df: pd.DataFrame,
-                 diag_df: pd.DataFrame, resid_df: pd.DataFrame | None) -> None:
+                 diag_df: pd.DataFrame, vif_df: pd.DataFrame | None,
+                 resid_df: pd.DataFrame | None) -> None:
     ws = wb.create_sheet(name[:31])
     bold = Font(bold=True)
     hdr_fill = PatternFill("solid", fgColor="DCE6F1")
@@ -99,6 +126,16 @@ def _write_sheet(wb: Workbook, name: str, header: dict, coef_df: pd.DataFrame,
     for cell in ws[ws.max_row - len(diag_df)]:
         cell.font = bold
         cell.fill = hdr_fill
+
+    if vif_df is not None and len(vif_df):
+        ws.append([])
+        ws.append(["Multicollinearity (VIF)"])
+        ws.cell(row=ws.max_row, column=1).font = bold
+        for r in dataframe_to_rows(vif_df, index=False, header=True):
+            ws.append(r)
+        for cell in ws[ws.max_row - len(vif_df)]:
+            cell.font = bold
+            cell.fill = hdr_fill
 
     if resid_df is not None and len(resid_df):
         ws.append([])
@@ -142,10 +179,11 @@ def run_all() -> None:
             }
             coef = _coef_table(res)
             diag = _diag_table(res, n_obs)
+            vif = _vif_table(sub, dep, regressors)
             resid = pd.DataFrame({"actual": res.fittedvalues + res.resid,
                                   "fitted": res.fittedvalues,
                                   "residual": res.resid})
-            _write_sheet(wb, sheet_name, header, coef, diag, resid)
+            _write_sheet(wb, sheet_name, header, coef, diag, vif, resid)
 
             summary_rows.append({
                 "Model":     sheet_name,
@@ -174,6 +212,9 @@ def run_all() -> None:
         "Short-term segment includes peacetime months (no active long war).",
         "Light crude = WTI; Heavy crude = WCS (user CSV preferred, else WTI - $15 proxy).",
         "B1 (crude) and B2 (war) act as model selectors, not regressors.",
+        "Standard errors: Newey-West HAC, maxlags=6 (corrects for residual autocorrelation).",
+        "Dropped from prior spec: hormuz_threat, gpr, crack_spread (coefficients ~0 with wide CIs).",
+        "Per-sheet VIF table flags multicollinearity; lagged log price inherently dominates.",
     ]
     for n in notes:
         ws.append([n])

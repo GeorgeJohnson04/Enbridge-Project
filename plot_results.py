@@ -50,7 +50,7 @@ def _fit(df: pd.DataFrame, dep: str, regressors: list[str]):
     sub = df[cols].dropna()
     X = sm.add_constant(sub[regressors])
     y = sub[dep]
-    res = sm.OLS(y, X).fit()
+    res = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
     return res, sub.index
 
 

@@ -27,20 +27,27 @@ Threshold lives in `config.LONG_WAR_MONTHS`.
 ```
 log(real_price_t) = α
                   + β3·log(production_t)
-                  + β4·hormuz_threat_t
                   + β5·log(inventory_t)
                   + β6·log(real_price_{t-1})        # B6 lag
                   + β7·net_exports_t
                   + β8·refinery_util_t              # D8
                   + β9·log(DXY_t)
-                  + β10·gpr_t
-                  + β11·crack_spread_t              # Brent-WTI proxy
                   + β12·month_sin + β13·month_cos    # seasonality
                   + ε_t
 ```
 
 Real prices are CPI-deflated to **2025 USD** (configurable via
 `config.REAL_PRICE_BASE_YEAR`).
+
+**Inference:** standard errors are Newey-West (HAC) with `maxlags=6`, since
+residuals show lag-1 autocorrelation (Durbin-Watson ~1.0-1.3). Plain OLS SEs
+under-state uncertainty; HAC corrects t-stats and CIs.
+
+**Dropped regressors:** the prior spec also included `hormuz_threat`, `gpr`
+(geopolitical risk), and `crack_spread` (Brent-WTI). All three had coefficients
+indistinguishable from zero with wide CIs across all four cells, so they added
+noise without explanatory power. They remain in the feature panel; just removed
+from `config.REGRESSORS`.
 
 ## Variable map (user spec → implementation)
 
@@ -49,15 +56,12 @@ Real prices are CPI-deflated to **2025 USD** (configurable via
 | B1   | Crude type           | Selector: WTI vs WCS                         |
 | B2   | Iran war length      | Selector: from `config.WAR_WINDOWS`          |
 | B3   | Production           | EIA MCRFPUS2 (US field production)           |
-| B4   | Hormuz status        | `config.HORMUZ_THREAT_WINDOWS` binary        |
 | B5   | Inventory / reserves | EIA MCESTUS1 (US ending stocks ex-SPR)       |
 | B6   | Lagged price         | log(real_price)_{t-1}                        |
 | B7   | Net exports          | EIA MCREXUS2 - MCRIMUS2                      |
 | D8   | Refinery run rate    | EIA MOPUEUS2 (operable utilization %)        |
-| ε    | Error                | OLS residual                                 |
+| ε    | Error                | OLS residual (HAC-corrected SEs)             |
 | —    | DXY (added)          | FRED DTWEXBGS                                |
-| —    | GPR index (added)    | Caldara-Iacoviello geopolitical risk index   |
-| —    | Crack spread (added) | Brent - WTI proxy (FRED MCOILBRENTEU/WTICO)  |
 | —    | Seasonality (added)  | Sin/cos of calendar month                    |
 
 ## Quick start

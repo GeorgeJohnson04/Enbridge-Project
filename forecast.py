@@ -1,5 +1,5 @@
 """
-Price forecast through April 2027.
+Price forecast through August 2026.
 
 For each crude type, fits the Long-term war model (current state: Israel-Iran
 ongoing conflict, well past the 6-month threshold) and projects forward by:
@@ -22,7 +22,7 @@ import statsmodels.api as sm
 
 import config
 
-FORECAST_END = pd.Timestamp("2027-04-01")  # next fiscal year end
+FORECAST_END = pd.Timestamp("2026-08-01")  # shortened horizon
 
 CRUDE_SPECS = [
     # (label, dep, lag_var, level_col, color)
@@ -31,8 +31,7 @@ CRUDE_SPECS = [
 ]
 
 EXO_COLS = ["log_production", "log_inventory", "net_exports",
-            "refinery_util", "log_dxy", "gpr", "crack_spread",
-            "hormuz_threat"]
+            "refinery_util", "log_dxy"]
 
 
 def _resolve_regressors(lag_var: str) -> list[str]:
@@ -44,7 +43,7 @@ def _fit(df: pd.DataFrame, dep: str, regressors: list[str]):
     sub = df[cols].dropna()
     X = sm.add_constant(sub[regressors])
     y = sub[dep]
-    return sm.OLS(y, X).fit()
+    return sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
 
 
 def _last_known(df: pd.DataFrame, col: str) -> float:
@@ -106,7 +105,7 @@ def chart_forecast(df: pd.DataFrame, forecasts: dict, last_dates: dict):
     fig, ax = plt.subplots(figsize=(13, 6.5))
 
     # Historical: last 5 years for context
-    cutoff = pd.Timestamp("2027-04-01") - pd.DateOffset(years=6)
+    cutoff = FORECAST_END - pd.DateOffset(years=6)
     hist = df.loc[df.index >= cutoff]
 
     ax.plot(hist.index, hist["wti_real"], color="#16697A", lw=1.8,
@@ -137,7 +136,7 @@ def chart_forecast(df: pd.DataFrame, forecasts: dict, last_dates: dict):
                 xytext=(8, 0), textcoords="offset points",
                 fontsize=9, color="#555560", style="italic")
 
-    ax.set_title("Oil price forecast through April 2027\n"
+    ax.set_title("Oil price forecast through August 2026\n"
                  "Solid = actual prices; dashed = model projection; shaded = 95% confidence range")
     ax.set_ylabel("Price per barrel (USD, 2025 dollars)")
     ax.legend(loc="upper left", framealpha=0.95)
@@ -169,7 +168,7 @@ def main():
         end_lo = fcst["price_lo_95"].iloc[-1]
         end_hi = fcst["price_hi_95"].iloc[-1]
         print(f"  {crude:5s}  last actual {last_date.date()} ${last_actual:6.2f}  "
-              f"->  Apr 2027 ${end_pred:6.2f}  "
+              f"->  Aug 2026 ${end_pred:6.2f}  "
               f"(95% range: ${end_lo:.2f} - ${end_hi:.2f})")
 
     pieces = []
