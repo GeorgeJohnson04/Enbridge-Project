@@ -1,14 +1,16 @@
 """
-Fits the four log-OLS oil price models and writes results to
-output/OLS_Model_Results.xlsx.
+Fits three model families and writes results to output/OLS_Model_Results.xlsx:
 
-Segmentation:
-    Light crude  (B1=1) -> dependent variable = log(WTI_real)
-    Heavy crude  (B1=0) -> dependent variable = log(WCS_real)
-    Short-term  (B2=0) -> rows where war_long == 0 (peace + flare-ups <6mo)
-    Long-term   (B2=1) -> rows where war_long == 1 (sustained conflict >=6mo)
+  1. LEVELS    — log(real price) regressed on log(price)_{t-1} + macro factors.
+                 Segmented 4 ways: {Light, Heavy} x {Short-term war, Long-term war}.
+                 Inflated R^2 because the lag dominates — kept for back-compat.
+  2. RETURNS   — Δlog(real price) regressed on Δmacro + event dummies.
+                 Honest target: low R^2 but unbiased. Same 4-way segmentation.
+  3. DIFFERENTIAL — (WCS - WTI) in $/bbl, single model.
+                    The Enbridge-relevant spec: heavy/light spread driven by
+                    pipeline takeaway and US storage dynamics.
 
-Four models => 2 (crude) x 2 (war state) cells.
+All models use Newey-West HAC standard errors (maxlags=6).
 """
 from __future__ import annotations
 
@@ -17,38 +19,61 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Font, PatternFill
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 import config
 
-# (crude_label, B1, dep_var, lag_var)
+# (crude_label, B1, dep_levels, lag_levels, dep_returns, lag_returns)
 CRUDE_SPECS = [
-    ("Light", 1, "log_wti_real", "log_wti_lag1"),
-    ("Heavy", 0, "log_wcs_real", "log_wcs_lag1"),
+    ("Light", 1, "log_wti_real", "log_wti_lag1", "dlog_wti_real", "dlog_wti_lag1"),
+    ("Heavy", 0, "log_wcs_real", "log_wcs_lag1", "dlog_wcs_real", "dlog_wcs_lag1"),
 ]
-# (war_label, B2)
-WAR_SPECS = [
-    ("Short-term", 0),
-    ("Long-term",  1),
-]
-
-# Map config.REGRESSORS placeholder name "log_price_lag1" to the per-crude variant
-def _resolve_regressors(lag_var: str) -> list[str]:
-    return [lag_var if x == "log_price_lag1" else x for x in config.REGRESSORS]
+WAR_SPECS = [("Short-term", 0), ("Long-term", 1)]
 
 
-def _fit_one(df: pd.DataFrame, dep: str, regressors: list[str]) -> sm.regression.linear_model.RegressionResultsWrapper:
+def _resolve(regressors: list[str], placeholder: str, replacement: str) -> list[str]:
+    return [replacement if x == placeholder else x for x in regressors]
+
+
+def _resolve_levels(lag_var: str) -> list[str]:
+    return _resolve(config.REGRESSORS, "log_price_lag1", lag_var)
+
+
+def _resolve_returns(lag_var: str) -> list[str]:
+    return _resolve(config.REGRESSORS_RETURNS, "dlog_price_lag1", lag_var)
+
+
+def _ensure_lag_returns(df: pd.DataFrame, lag_var: str) -> pd.DataFrame:
+    """Compute dlog_*_lag1 on the fly so the returns spec doesn't need
+    pre-baked columns."""
+    base = lag_var.replace("_lag1", "")
+    if lag_var not in df.columns and base in df.columns:
+        df = df.copy()
+        df[lag_var] = df[base].shift(1)
+    return df
+
+
+def _drop_constant_cols(sub: pd.DataFrame, regressors: list[str]) -> list[str]:
+    """Drop regressors that are constant within the fit sub-sample (perfectly
+    collinear with the intercept). Common when a regime dummy has 0 (or 1)
+    coverage in a particular war-state slice."""
+    keep = []
+    for r in regressors:
+        if sub[r].nunique(dropna=True) > 1:
+            keep.append(r)
+    return keep
+
+
+def _fit(df: pd.DataFrame, dep: str, regressors: list[str]):
     cols = [dep] + regressors
     sub = df[cols].dropna()
+    regressors = _drop_constant_cols(sub, regressors)
     if len(sub) < len(regressors) + 5:
         raise ValueError(f"Too few observations: {len(sub)} (need {len(regressors)+5}+)")
     X = sm.add_constant(sub[regressors])
     y = sub[dep]
-    # HAC (Newey-West) standard errors — residuals exhibit lag-1 autocorrelation
-    # (DW ~1.0-1.3), so default OLS SEs are biased downward. maxlags=6 follows
-    # the rule-of-thumb 4*(n/100)^(2/9) for monthly data with n~100-250.
-    return sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
+    return sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 6}), sub
 
 
 def _coef_table(res) -> pd.DataFrame:
@@ -71,12 +96,6 @@ def _diag_table(res, n_obs: int) -> pd.DataFrame:
 
 
 def _vif_table(df: pd.DataFrame, dep: str, regressors: list[str]) -> pd.DataFrame:
-    """Variance Inflation Factor for each regressor on the same sample the model used.
-
-    Rule of thumb: VIF > 5 = noticeable collinearity, > 10 = problematic.
-    The lagged log price will dominate (expected, not fixable without changing
-    the model spec) — flag is informational.
-    """
     sub = df[[dep] + regressors].dropna()
     X = sm.add_constant(sub[regressors])
     rows = []
@@ -87,8 +106,11 @@ def _vif_table(df: pd.DataFrame, dep: str, regressors: list[str]) -> pd.DataFram
             v = variance_inflation_factor(X.values, i)
         except Exception:
             v = float("nan")
-        rows.append({"variable": name, "VIF": round(v, 3),
-                     "flag": "HIGH" if v > 10 else ("watch" if v > 5 else "")})
+        rows.append({
+            "variable": name,
+            "VIF": round(v, 3),
+            "flag": "HIGH" if v > 10 else ("watch" if v > 5 else ""),
+        })
     return pd.DataFrame(rows)
 
 
@@ -115,8 +137,7 @@ def _write_sheet(wb: Workbook, name: str, header: dict, coef_df: pd.DataFrame,
     for r in dataframe_to_rows(coef_df, index=False, header=True):
         ws.append(r)
     for cell in ws[ws.max_row - len(coef_df)]:
-        cell.font = bold
-        cell.fill = hdr_fill
+        cell.font = bold; cell.fill = hdr_fill
     ws.append([])
 
     ws.append(["Diagnostics"])
@@ -124,8 +145,7 @@ def _write_sheet(wb: Workbook, name: str, header: dict, coef_df: pd.DataFrame,
     for r in dataframe_to_rows(diag_df, index=False, header=True):
         ws.append(r)
     for cell in ws[ws.max_row - len(diag_df)]:
-        cell.font = bold
-        cell.fill = hdr_fill
+        cell.font = bold; cell.fill = hdr_fill
 
     if vif_df is not None and len(vif_df):
         ws.append([])
@@ -134,8 +154,7 @@ def _write_sheet(wb: Workbook, name: str, header: dict, coef_df: pd.DataFrame,
         for r in dataframe_to_rows(vif_df, index=False, header=True):
             ws.append(r)
         for cell in ws[ws.max_row - len(vif_df)]:
-            cell.font = bold
-            cell.fill = hdr_fill
+            cell.font = bold; cell.fill = hdr_fill
 
     if resid_df is not None and len(resid_df):
         ws.append([])
@@ -145,82 +164,164 @@ def _write_sheet(wb: Workbook, name: str, header: dict, coef_df: pd.DataFrame,
             ws.append(r)
 
     for col in ws.columns:
-        max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col)
+        max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 28)
+
+
+def _fit_levels_family(df: pd.DataFrame, wb: Workbook, summary_rows: list):
+    print("\n[ LEVELS family — log(real price) ]")
+    for crude_label, b1, dep_lvl, lag_lvl, _, _ in CRUDE_SPECS:
+        for war_label, b2 in WAR_SPECS:
+            sub = df[df["war_long"] == b2]
+            regs = _resolve_levels(lag_lvl)
+            try:
+                res, fit_df = _fit(sub, dep_lvl, regs)
+            except ValueError as e:
+                print(f"  [SKIP] {crude_label} | {war_label}: {e}")
+                continue
+            n_obs = int(res.nobs)
+            sheet = f"L_{crude_label[:1]}_{war_label.replace('-', '')[:5]}"  # e.g. L_L_Short
+            header = {
+                "Family": "LEVELS  (log price ~ macro factors)",
+                "Crude (B1)":   f"{crude_label} ({b1})",
+                "War (B2)":     f"{war_label} ({b2})",
+                "Dependent":    dep_lvl,
+                "Sample n":     n_obs,
+                "Sample range": f"{fit_df.index.min().date()} to {fit_df.index.max().date()}",
+                "SE method":    "Newey-West HAC, maxlags=6",
+            }
+            coef = _coef_table(res)
+            diag = _diag_table(res, n_obs)
+            vif  = _vif_table(sub, dep_lvl, regs)
+            resid = pd.DataFrame({"actual": res.fittedvalues + res.resid,
+                                  "fitted": res.fittedvalues,
+                                  "residual": res.resid})
+            _write_sheet(wb, sheet, header, coef, diag, vif, resid)
+            summary_rows.append({
+                "Family": "Levels", "Sheet": sheet,
+                "Crude": crude_label, "War": war_label,
+                "n": n_obs, "R2": round(res.rsquared, 4),
+                "adj_R2": round(res.rsquared_adj, 4),
+                "DW": round(sm.stats.stattools.durbin_watson(res.resid), 3),
+            })
+            print(f"  [OK] {crude_label:5s} | {war_label:10s}  n={n_obs:3d}  R2={res.rsquared:.3f}")
+
+
+def _fit_returns_family(df: pd.DataFrame, wb: Workbook, summary_rows: list):
+    print("\n[ RETURNS family — Δlog(real price) ]")
+    for crude_label, b1, _, _, dep_ret, lag_ret in CRUDE_SPECS:
+        df_ext = _ensure_lag_returns(df, lag_ret)
+        for war_label, b2 in WAR_SPECS:
+            sub = df_ext[df_ext["war_long"] == b2]
+            regs = _resolve_returns(lag_ret)
+            # Filter to columns that exist (some optional like SPR may be missing)
+            regs = [r for r in regs if r in df_ext.columns]
+            try:
+                res, fit_df = _fit(sub, dep_ret, regs)
+            except ValueError as e:
+                print(f"  [SKIP] {crude_label} | {war_label}: {e}")
+                continue
+            n_obs = int(res.nobs)
+            sheet = f"R_{crude_label[:1]}_{war_label.replace('-', '')[:5]}"
+            header = {
+                "Family": "RETURNS  (Δlog price ~ Δfactors + events)",
+                "Crude (B1)":   f"{crude_label} ({b1})",
+                "War (B2)":     f"{war_label} ({b2})",
+                "Dependent":    dep_ret,
+                "Sample n":     n_obs,
+                "Sample range": f"{fit_df.index.min().date()} to {fit_df.index.max().date()}",
+                "SE method":    "Newey-West HAC, maxlags=6",
+                "Note": "R^2 will be much lower than the levels model — this is correct. Returns are mostly noise.",
+            }
+            coef = _coef_table(res)
+            diag = _diag_table(res, n_obs)
+            vif  = _vif_table(sub, dep_ret, regs)
+            resid = pd.DataFrame({"actual": res.fittedvalues + res.resid,
+                                  "fitted": res.fittedvalues,
+                                  "residual": res.resid})
+            _write_sheet(wb, sheet, header, coef, diag, vif, resid)
+            summary_rows.append({
+                "Family": "Returns", "Sheet": sheet,
+                "Crude": crude_label, "War": war_label,
+                "n": n_obs, "R2": round(res.rsquared, 4),
+                "adj_R2": round(res.rsquared_adj, 4),
+                "DW": round(sm.stats.stattools.durbin_watson(res.resid), 3),
+            })
+            print(f"  [OK] {crude_label:5s} | {war_label:10s}  n={n_obs:3d}  R2={res.rsquared:.3f}  (lower is honest)")
+
+
+def _fit_differential(df: pd.DataFrame, wb: Workbook, summary_rows: list):
+    print("\n[ DIFFERENTIAL — WCS minus WTI ($/bbl), single model ]")
+    regs = list(config.REGRESSORS_DIFFERENTIAL)
+    if "apportionment_lag1" in df.columns and df["apportionment_lag1"].notna().any():
+        regs.append("apportionment_lag1")
+        print(f"  apportionment_lag1 included ({df['apportionment_lag1'].notna().sum()} obs)")
+    regs = [r for r in regs if r in df.columns]
+    try:
+        res, fit_df = _fit(df, "wcs_wti_diff", regs)
+    except ValueError as e:
+        print(f"  [SKIP] {e}")
+        return
+    n_obs = int(res.nobs)
+    sheet = "D_WCS_WTI_diff"
+    header = {
+        "Family": "DIFFERENTIAL  (heavy-light spread)",
+        "Dependent":    "wcs_wti_diff (WCS - WTI, $/bbl, real)",
+        "Sample n":     n_obs,
+        "Sample range": f"{fit_df.index.min().date()} to {fit_df.index.max().date()}",
+        "SE method":    "Newey-West HAC, maxlags=6",
+        "Use":          "Models the WCS-WTI spread directly. Most relevant for Enbridge mainline economics.",
+    }
+    coef = _coef_table(res)
+    diag = _diag_table(res, n_obs)
+    vif  = _vif_table(df, "wcs_wti_diff", regs)
+    resid = pd.DataFrame({"actual": res.fittedvalues + res.resid,
+                          "fitted": res.fittedvalues,
+                          "residual": res.resid})
+    _write_sheet(wb, sheet, header, coef, diag, vif, resid)
+    summary_rows.append({
+        "Family": "Differential", "Sheet": sheet,
+        "Crude": "WCS-WTI", "War": "(all)",
+        "n": n_obs, "R2": round(res.rsquared, 4),
+        "adj_R2": round(res.rsquared_adj, 4),
+        "DW": round(sm.stats.stattools.durbin_watson(res.resid), 3),
+    })
+    print(f"  [OK] WCS-WTI diff  n={n_obs:3d}  R2={res.rsquared:.3f}")
 
 
 def run_all() -> None:
     df = pd.read_csv(config.FEATURES_CSV, index_col="date", parse_dates=True)
-
     wb = Workbook()
     wb.remove(wb.active)
+    summary_rows: list = []
 
-    # Summary sheet collected as we go
-    summary_rows = []
+    _fit_levels_family(df, wb, summary_rows)
+    _fit_returns_family(df, wb, summary_rows)
+    _fit_differential(df, wb, summary_rows)
 
-    for crude_label, b1, dep, lag in CRUDE_SPECS:
-        for war_label, b2 in WAR_SPECS:
-            sub = df[df["war_long"] == b2].copy()
-            regressors = _resolve_regressors(lag)
-            try:
-                res = _fit_one(sub, dep, regressors)
-            except ValueError as e:
-                print(f"  [SKIP] {crude_label} | {war_label}: {e}")
-                continue
-
-            n_obs = int(res.nobs)
-            sheet_name = f"{crude_label}_{war_label.replace('-', '')}"
-            header = {
-                "Crude type (B1)":   f"{crude_label} ({b1})",
-                "War state (B2)":    f"{war_label} ({b2})",
-                "Dependent variable": dep,
-                "Sample size":        n_obs,
-                "Sample period":      f"{sub.dropna(subset=[dep]+regressors).index.min().date()} to {sub.dropna(subset=[dep]+regressors).index.max().date()}",
-            }
-            coef = _coef_table(res)
-            diag = _diag_table(res, n_obs)
-            vif = _vif_table(sub, dep, regressors)
-            resid = pd.DataFrame({"actual": res.fittedvalues + res.resid,
-                                  "fitted": res.fittedvalues,
-                                  "residual": res.resid})
-            _write_sheet(wb, sheet_name, header, coef, diag, vif, resid)
-
-            summary_rows.append({
-                "Model":     sheet_name,
-                "Crude":     crude_label,
-                "War state": war_label,
-                "n":         n_obs,
-                "R2":        round(res.rsquared, 4),
-                "adj_R2":    round(res.rsquared_adj, 4),
-                "F p-value": round(res.f_pvalue, 4),
-                "DW":        round(sm.stats.stattools.durbin_watson(res.resid), 3),
-            })
-            print(f"  [OK]   {crude_label:5s} | {war_label:10s}  n={n_obs:3d}  R2={res.rsquared:.3f}  adj_R2={res.rsquared_adj:.3f}")
-
-    # Summary sheet
     summary = pd.DataFrame(summary_rows)
     ws = wb.create_sheet("Summary", 0)
-    ws.append(["OLS Oil Price Models - Summary"])
+    ws.append(["OLS Oil Price Models — Summary (3 families)"])
     ws["A1"].font = Font(bold=True, size=14)
     ws.append([])
-    ws.append(["Notes"])
-    ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+    ws.append(["Notes"]); ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
     notes = [
-        "Dependent variable is log of inflation-adjusted price (real USD).",
+        "Three model families:",
+        "  LEVELS       - log(real price); high R^2 driven mostly by AR(1) lag.",
+        "  RETURNS      - Δlog(real price); honest fit, much lower R^2.",
+        "  DIFFERENTIAL - WCS-WTI ($/bbl); Enbridge-relevant heavy/light spread.",
+        "Inference: Newey-West HAC standard errors, maxlags=6.",
         f"Real prices in {config.REAL_PRICE_BASE_YEAR} dollars; CPI = FRED CPIAUCSL.",
         f"Long-term war = active conflict lasting >= {config.LONG_WAR_MONTHS} months.",
-        "Short-term segment includes peacetime months (no active long war).",
-        "Light crude = WTI; Heavy crude = WCS (user CSV preferred, else WTI - $15 proxy).",
-        "B1 (crude) and B2 (war) act as model selectors, not regressors.",
-        "Standard errors: Newey-West HAC, maxlags=6 (corrects for residual autocorrelation).",
-        "Dropped from prior spec: hormuz_threat, gpr, crack_spread (coefficients ~0 with wide CIs).",
-        "Per-sheet VIF table flags multicollinearity; lagged log price inherently dominates.",
+        "Out-of-sample validation: see backtest.py and output/backtest_results.csv.",
+        "",
+        "WHICH MODEL TO TRUST: the LEVELS R^2 is misleading (mostly the lag).",
+        "The RETURNS model is the honest one. The DIFFERENTIAL model is the",
+        "structural one for Enbridge. Always cross-check with the backtest.",
     ]
-    for n in notes:
-        ws.append([n])
+    for n in notes: ws.append([n])
     ws.append([])
-    ws.append(["Model fit summary"])
-    ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+    ws.append(["Model fit summary (in-sample)"]); ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
     for r in dataframe_to_rows(summary, index=False, header=True):
         ws.append(r)
     for col in ws.columns:
@@ -228,7 +329,6 @@ def run_all() -> None:
             (len(str(c.value)) if c.value is not None else 0 for c in col), default=10
         ) + 2
 
-    # Data sheet (last 60 months for reference, full file is data/panel_features.csv)
     ws = wb.create_sheet("Data_recent")
     recent = df.tail(60).reset_index()
     for r in dataframe_to_rows(recent, index=False, header=True):

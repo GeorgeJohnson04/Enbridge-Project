@@ -3,13 +3,16 @@ Pulls every input series from FRED and EIA and assembles a single monthly
 panel saved to data/panel_raw.csv.
 
 FRED: WTI, Brent, CPI, DXY (free CSV, no API key)
-EIA:  Production, inventory, refinery utilization, exports, imports
+EIA:  Production, inventory, refinery utilization, exports, imports, SPR
       (free XLS hist_xls bulk files, no API key)
 GPR:  Caldara-Iacoviello Geopolitical Risk Index (XLS)
+CBOE: OVX (oil volatility index, daily CSV)
+CFTC: Disaggregated COT — managed money positioning in WTI futures
 """
 from __future__ import annotations
 
 import io
+import zipfile
 from datetime import datetime
 
 import numpy as np
@@ -20,6 +23,8 @@ import config
 
 FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
 EIA_XLS  = "https://www.eia.gov/dnav/pet/hist_xls/{sid}m.xls"
+OVX_CSV  = "https://cdn.cboe.com/api/global/us_indices/daily_prices/OVX_History.csv"
+COT_ZIP  = "https://www.cftc.gov/sites/default/files/files/dea/history/fut_disagg_xls_{year}.zip"
 HEADERS  = {"User-Agent": "Mozilla/5.0 (oil-ols-model)"}
 
 # EIA series we need (replaces broken FRED IDs)
@@ -29,6 +34,7 @@ EIA_SERIES = {
     "refinery_util":  "MOPUEUS2",   # Refinery Operable Utilization, %
     "exports_us":     "MCREXUS2",   # Crude Oil Exports, kbbl/day
     "imports_us":     "MCRIMUS2",   # Crude Oil Imports, kbbl/day
+    "spr_stocks":     "MCSSTUS1",   # SPR Ending Stocks, kbbl (monthly)
 }
 
 
@@ -76,6 +82,89 @@ def _load_user_wcs() -> pd.Series | None:
         return None
     df["date"] = pd.to_datetime(df["date"])
     return _to_monthly(df.set_index("date")["price"].rename("wcs_user"), "mean")
+
+
+def _fetch_ovx() -> pd.Series | None:
+    """CBOE Oil VIX — daily, resampled to monthly mean."""
+    try:
+        r = requests.get(OVX_CSV, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [c.strip() for c in df.columns]
+        df["DATE"] = pd.to_datetime(df["DATE"])
+        s = df.set_index("DATE")["OVX"].astype(float).rename("ovx")
+        return s.resample("MS").mean()
+    except Exception as e:
+        print(f"  ! OVX fetch failed: {e}")
+        return None
+
+
+def _fetch_cot_managed_money(years: list[int]) -> pd.Series | None:
+    """CFTC Disaggregated COT — managed money net WTI futures positioning.
+
+    Returns positions as PERCENT of open interest (scale-invariant).
+
+    NYMEX renamed the contract around 2022:
+      - 2010-2021: 'CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE'
+      - 2022+:     'WTI FINANCIAL CRUDE OIL - NEW YORK MERCANTILE EXCHANGE'
+    We try both each year and take whichever has more rows.
+    """
+    market_aliases = [
+        "CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE",
+        "WTI FINANCIAL CRUDE OIL - NEW YORK MERCANTILE EXCHANGE",
+    ]
+    pieces = []
+    for year in years:
+        url = COT_ZIP.format(year=year)
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=60)
+            if not r.ok:
+                continue
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+            df = pd.read_excel(zf.open(zf.namelist()[0]))
+            best = None
+            for m in market_aliases:
+                sub = df[df["Market_and_Exchange_Names"] == m]
+                if best is None or len(sub) > len(best):
+                    best = sub
+            if best is None or best.empty:
+                continue
+            sub = best.copy()
+            sub["date"] = pd.to_datetime(sub["Report_Date_as_MM_DD_YYYY"])
+            sub["mm_net_pct_oi"] = (
+                sub["Pct_of_OI_M_Money_Long_All"]
+                - sub["Pct_of_OI_M_Money_Short_All"]
+            )
+            pieces.append(sub[["date", "mm_net_pct_oi"]])
+        except Exception as e:
+            print(f"  ! COT {year} failed: {e}")
+    if not pieces:
+        return None
+    out = (
+        pd.concat(pieces)
+        .drop_duplicates(subset=["date"])
+        .sort_values("date")
+        .set_index("date")["mm_net_pct_oi"]
+    )
+    return out.resample("MS").mean().rename("cot_mm_net_pct_oi")
+
+
+def _load_user_csv(path, value_col: str) -> pd.Series | None:
+    """Generic user-CSV loader for fallback data sources (rig count, OPEC,
+    apportionment). Expects two columns: Date + a value column. Renames the
+    value to the supplied name and snaps to month-start."""
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "date" not in df.columns:
+        print(f"  ! {path.name}: missing 'date' column")
+        return None
+    val = next((c for c in df.columns if c != "date"), None)
+    if val is None:
+        return None
+    df["date"] = pd.to_datetime(df["date"]).dt.to_period("M").dt.to_timestamp()
+    return df.set_index("date")[val].astype(float).rename(value_col)
 
 
 def _fetch_gpr() -> pd.Series | None:
@@ -131,7 +220,7 @@ def fetch_panel() -> pd.DataFrame:
         if k in raw:
             panel[k] = raw[k].reindex(panel.index)
 
-    for k in ("production_us", "inventory_us", "refinery_util"):
+    for k in ("production_us", "inventory_us", "refinery_util", "spr_stocks"):
         if k in raw:
             panel[k] = raw[k].reindex(panel.index)
 
@@ -167,6 +256,50 @@ def fetch_panel() -> pd.DataFrame:
     else:
         panel["gpr"] = 100.0
         print(f"  ! GPR fetch failed - using neutral baseline 100")
+
+    print("\nFetching CBOE OVX (oil volatility)...")
+    ovx = _fetch_ovx()
+    if ovx is not None:
+        panel["ovx"] = ovx.reindex(panel.index)
+        print(f"  ovx            cboe           {panel['ovx'].notna().sum()} obs (starts ~2009)")
+    else:
+        panel["ovx"] = np.nan
+        print(f"  ! OVX fetch failed - column will be NaN")
+
+    print("\nFetching CFTC COT (managed money WTI positioning)...")
+    cot_years = list(range(2010, datetime.today().year + 1))
+    cot = _fetch_cot_managed_money(cot_years)
+    if cot is not None:
+        panel["cot_mm_net_pct"] = cot.reindex(panel.index)
+        print(f"  cot_mm_net_pct cftc           {panel['cot_mm_net_pct'].notna().sum()} obs (managed money net % of OI)")
+    else:
+        panel["cot_mm_net_pct"] = np.nan
+        print(f"  ! COT fetch failed - column will be NaN")
+
+    print("\nLoading optional user-CSV fallbacks (data/ directory)...")
+    rig = _load_user_csv(config.USER_RIGCOUNT_CSV, "rig_count")
+    if rig is not None:
+        panel["rig_count"] = rig.reindex(panel.index)
+        print(f"  rig_count      user_csv       {panel['rig_count'].notna().sum()} obs")
+    else:
+        panel["rig_count"] = np.nan
+        print(f"  - rig_count: no {config.USER_RIGCOUNT_CSV.name} (drop in to enable)")
+
+    opec = _load_user_csv(config.USER_OPEC_PROD_CSV, "opec_production")
+    if opec is not None:
+        panel["opec_production"] = opec.reindex(panel.index)
+        print(f"  opec_production user_csv      {panel['opec_production'].notna().sum()} obs")
+    else:
+        panel["opec_production"] = np.nan
+        print(f"  - opec_production: no {config.USER_OPEC_PROD_CSV.name} (using event dummies instead)")
+
+    appo = _load_user_csv(config.USER_APPORTIONMENT_CSV, "apportionment_pct")
+    if appo is not None:
+        panel["apportionment_pct"] = appo.reindex(panel.index)
+        print(f"  apportionment  user_csv       {panel['apportionment_pct'].notna().sum()} obs")
+    else:
+        panel["apportionment_pct"] = np.nan
+        print(f"  - apportionment_pct: no {config.USER_APPORTIONMENT_CSV.name} (used in differential model if present)")
 
     panel.index.name = "date"
     panel.to_csv(config.RAW_PANEL_CSV)

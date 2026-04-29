@@ -41,6 +41,10 @@ CRUDE_SPECS = [
 WAR_SPECS = [("Short-term", 0), ("Long-term", 1)]
 
 
+def _drop_constant_cols(sub, regressors):
+    return [r for r in regressors if sub[r].nunique(dropna=True) > 1]
+
+
 def _resolve_regressors(lag_var: str) -> list[str]:
     return [lag_var if x == "log_price_lag1" else x for x in config.REGRESSORS]
 
@@ -48,6 +52,7 @@ def _resolve_regressors(lag_var: str) -> list[str]:
 def _fit(df: pd.DataFrame, dep: str, regressors: list[str]):
     cols = [dep] + regressors
     sub = df[cols].dropna()
+    regressors = _drop_constant_cols(sub, regressors)
     X = sm.add_constant(sub[regressors])
     y = sub[dep]
     res = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
@@ -314,6 +319,59 @@ def chart_correlation_heatmap(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+def chart_differential_history(df: pd.DataFrame):
+    """WCS-WTI spread over time with regime overlay (TMX in-service, COVID,
+    Russia war). Shows the structural breaks the differential model exploits."""
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    diff = df["wcs_wti_diff"].dropna()
+    ax.plot(diff.index, diff.values, color="#16697A", lw=1.6, label="WCS - WTI ($/bbl, real)")
+    ax.axhline(0, color="black", lw=0.6)
+    palette = {"shale_era": "#2A8B5E", "covid": "#B83A4B",
+               "russia_war": "#D4A55A", "tmx_inservice": "#7A4FB8"}
+    for key, start, end, desc in config.STRUCTURAL_BREAKS:
+        s = pd.Timestamp(start)
+        e = pd.Timestamp(end) if end else df.index.max()
+        if s > df.index.max() or e < df.index.min():
+            continue
+        ax.axvspan(s, e, color=palette.get(key, "gray"), alpha=0.10, lw=0)
+        # Label at top
+        mid = s + (e - s) / 2
+        ax.annotate(desc.split('(')[0].strip(), xy=(mid, ax.get_ylim()[1] * 0.95 if ax.get_ylim()[1] else 0),
+                    xytext=(0, -8), textcoords="offset points",
+                    ha="center", fontsize=7, color=palette.get(key, "gray"),
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7))
+    ax.set_title("WCS - WTI heavy/light spread with structural-break regimes\n"
+                 "Negative = WCS at discount (typical); narrowing = better Enbridge mainline economics")
+    ax.set_ylabel("Spread ($/bbl)")
+    ax.legend(loc="upper left", framealpha=0.9)
+    ax.grid(alpha=0.3)
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
+    out = config.CHARTS_DIR / "10_differential_history.png"
+    fig.tight_layout(); fig.savefig(out); plt.close(fig)
+    print(f"  {out.name}")
+
+
+def chart_opec_events(df: pd.DataFrame):
+    """Stem chart of OPEC+ supply policy events with cumulative line."""
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    shocks = df["opec_shock"].copy()
+    shocks_only = shocks[shocks != 0]
+    cum = df["opec_cumulative"]
+    colors = ["#2A8B5E" if v > 0 else "#B83A4B" for v in shocks_only.values]
+    ax.bar(shocks_only.index, shocks_only.values, width=60, color=colors, alpha=0.85,
+           label="Single-event delta (mbd)")
+    ax2 = ax.twinx()
+    ax2.plot(cum.index, cum.values, color="#1F1F2E", lw=1.6, label="Cumulative supply policy stance (mbd)")
+    ax.axhline(0, color="black", lw=0.5)
+    ax.set_title("OPEC+ supply policy events (green = cuts, red = increases)")
+    ax.set_ylabel("Per-event Δ production (mbd)", color="#1F1F2E")
+    ax2.set_ylabel("Cumulative (mbd)", color="#1F1F2E")
+    ax.grid(alpha=0.3, axis="y")
+    out = config.CHARTS_DIR / "11_opec_events.png"
+    fig.tight_layout(); fig.savefig(out); plt.close(fig)
+    print(f"  {out.name}")
+
+
 def main():
     df = pd.read_csv(config.FEATURES_CSV, index_col="date", parse_dates=True)
     print(f"Generating charts -> {config.CHARTS_DIR}/")
@@ -323,6 +381,8 @@ def main():
     chart_residual_diagnostics(df)
     chart_coefficients_comparison(df)
     chart_correlation_heatmap(df)
+    chart_differential_history(df)
+    chart_opec_events(df)
     print("Done.")
 
 
